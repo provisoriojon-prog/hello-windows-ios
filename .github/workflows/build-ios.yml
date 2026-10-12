@@ -1,0 +1,197 @@
+name: Build iOS IPA on macOS
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 20
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+    steps:
+      - name: Download source
+        uses: actions/checkout@v4
+      - name: Create Hello World source
+        run: |
+          mkdir -p HelloWindows
+          cat > HelloWindows/HelloWindowsApp.swift <<'HELLO_SOURCE'
+          import SwiftUI
+          
+          @main
+          struct HelloWindowsApp: App {
+              var body: some Scene {
+                  WindowGroup {
+                      ContentView()
+                  }
+              }
+          }
+          
+          struct ContentView: View {
+              @State private var taps = 0
+          
+              var body: some View {
+                  ZStack {
+                      LinearGradient(colors: [.indigo, .blue, .cyan],
+                                     startPoint: .topLeading, endPoint: .bottomTrailing)
+                          .ignoresSafeArea()
+                      VStack(spacing: 24) {
+                          Image(systemName: "hand.wave.fill")
+                              .font(.system(size: 76))
+                              .foregroundStyle(.yellow)
+                          Text("Olá, mundo!")
+                              .font(.system(size: 38, weight: .bold))
+                          Text("Criado no Windows.\nCompilado no macOS do GitHub.")
+                              .font(.title3)
+                              .multilineTextAlignment(.center)
+                          Button {
+                              taps += 1
+                          } label: {
+                              Text(taps == 0 ? "Toque para testar" : "Toques: \(taps)")
+                                  .font(.headline)
+                                  .padding(.horizontal, 28)
+                                  .padding(.vertical, 16)
+                                  .background(.white, in: Capsule())
+                                  .foregroundStyle(.indigo)
+                          }
+                          Text("Hello Windows • iOS nativo")
+                              .font(.footnote)
+                              .opacity(0.8)
+                      }
+                      .foregroundStyle(.white)
+                      .padding(24)
+                  }
+              }
+          }
+          HELLO_SOURCE
+          cat > project.yml <<'HELLO_SOURCE'
+          name: HelloWindows
+          options:
+            bundleIdPrefix: com.demo
+            deploymentTarget:
+              iOS: "16.0"
+          targets:
+            HelloWindows:
+              type: application
+              platform: iOS
+              sources:
+                - HelloWindows
+              settings:
+                base:
+                  PRODUCT_BUNDLE_IDENTIFIER: com.demo.hellowindows
+                  PRODUCT_NAME: HelloWindows
+                  SWIFT_VERSION: "5.0"
+                  TARGETED_DEVICE_FAMILY: "1,2"
+                  CODE_SIGNING_ALLOWED: NO
+                  CODE_SIGNING_REQUIRED: NO
+                  MARKETING_VERSION: "1.0"
+                  CURRENT_PROJECT_VERSION: "1"
+              info:
+                path: HelloWindows/Info.plist
+                properties:
+                  CFBundleDisplayName: Hello Windows
+                  LSRequiresIPhoneOS: true
+                  UILaunchScreen: {}
+                  UIApplicationSceneManifest:
+                    UIApplicationSupportsMultipleScenes: false
+                  UISupportedInterfaceOrientations:
+                    - UIInterfaceOrientationPortrait
+                    - UIInterfaceOrientationLandscapeLeft
+                    - UIInterfaceOrientationLandscapeRight
+          schemes:
+            HelloWindows:
+              build:
+                targets:
+                  HelloWindows: all
+              archive:
+                config: Release
+          HELLO_SOURCE
+          mkdir -p scripts
+          cat > scripts/verify_ipa.py <<'HELLO_SOURCE'
+          """Inspect the actual IPA produced by Xcode, fail if it is not an iPhone binary."""
+          import hashlib
+          import json
+          import plistlib
+          import struct
+          import sys
+          from pathlib import Path
+          from zipfile import ZipFile
+          
+          ipa = Path(sys.argv[1])
+          with ZipFile(ipa) as archive:
+              assert archive.testzip() is None, "Corrupt ZIP member"
+              prefix = "Payload/HelloWindows.app/"
+              info = plistlib.loads(archive.read(prefix + "Info.plist"))
+              binary = archive.read(prefix + info["CFBundleExecutable"])
+              assert info["CFBundleIdentifier"] == "com.demo.hellowindows"
+              assert info["CFBundlePackageType"] == "APPL"
+              assert info["DTPlatformName"] == "iphoneos", "Must be built for physical iPhone"
+              assert "iPhoneOS" in info["CFBundleSupportedPlatforms"]
+              assert len(binary) > 4096, "Missing compiled executable"
+              magic, cpu_type = struct.unpack_from("<II", binary)
+              assert magic == 0xFEEDFACF, "Expected a 64-bit Mach-O executable"
+              assert cpu_type == 0x0100000C, "Expected ARM64"
+              result = {
+                  "verified": True,
+                  "file": ipa.name,
+                  "bytes": ipa.stat().st_size,
+                  "sha256": hashlib.sha256(ipa.read_bytes()).hexdigest(),
+                  "bundle_identifier": info["CFBundleIdentifier"],
+                  "executable": info["CFBundleExecutable"],
+                  "platform": info["DTPlatformName"],
+                  "minimum_ios": info["MinimumOSVersion"],
+                  "sdk": info.get("DTSDKName"),
+                  "architecture": "arm64",
+                  "format": "Mach-O 64-bit",
+                  "apple_signed": False,
+                  "note": "Real compiled device binary; signing and physical installation still required.",
+              }
+          print(json.dumps(result, indent=2))
+          HELLO_SOURCE
+      - name: Record macOS and Xcode
+        run: |
+          mkdir -p dist
+          sw_vers | tee dist/build-environment.txt
+          xcodebuild -version | tee -a dist/build-environment.txt
+          xcrun --sdk iphoneos --show-sdk-version | tee -a dist/build-environment.txt
+      - name: Generate Xcode project
+        run: |
+          brew install xcodegen
+          xcodegen generate
+      - name: Compile real iPhone application
+        run: |
+          set -o pipefail
+          xcodebuild -project HelloWindows.xcodeproj \
+            -scheme HelloWindows -configuration Release \
+            -sdk iphoneos -destination 'generic/platform=iOS' \
+            -archivePath build/HelloWindows.xcarchive \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" archive 2>&1 | tee dist/xcodebuild.log
+      - name: Package and inspect unsigned IPA
+        run: |
+          mkdir -p build/package/Payload
+          cp -R build/HelloWindows.xcarchive/Products/Applications/HelloWindows.app build/package/Payload/
+          cd build/package
+          zip -r -q ../../dist/HelloWindows-unsigned.ipa Payload
+          cd ../..
+          file build/package/Payload/HelloWindows.app/HelloWindows | tee dist/binary-inspection.txt
+          xcrun lipo -archs build/package/Payload/HelloWindows.app/HelloWindows | tee -a dist/binary-inspection.txt
+          python3 scripts/verify_ipa.py dist/HelloWindows-unsigned.ipa > dist/verification.json
+          shasum -a 256 dist/HelloWindows-unsigned.ipa | tee dist/SHA256.txt
+          {
+            echo '### iPhone IPA compiled successfully on macOS'
+            echo 'Unsigned application: Apple signing is still required to install on an iPhone.'
+            echo "Commit: $GITHUB_SHA"
+            echo '```'
+            cat dist/build-environment.txt dist/binary-inspection.txt dist/SHA256.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Save IPA and build evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: HelloWindows-IPA-and-proof
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
