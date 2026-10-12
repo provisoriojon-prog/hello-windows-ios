@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
 permissions:
-  contents: read
+  contents: write
 jobs:
   build:
     runs-on: macos-15
@@ -13,7 +13,7 @@ jobs:
       HOMEBREW_NO_AUTO_UPDATE: "1"
     steps:
       - name: Download source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
       - name: Create Hello World source
         run: |
           mkdir -p HelloWindows
@@ -189,9 +189,18 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Save IPA and build evidence
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: HelloWindows-IPA-and-proof
           path: dist/
           if-no-files-found: error
           retention-days: 30
+      - name: Publish direct IPA download
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "hello-${GITHUB_RUN_NUMBER}" dist/* \
+            --target "$GITHUB_SHA" \
+            --title "Hello Windows - iOS build ${GITHUB_RUN_NUMBER}" \
+            --notes "Native SwiftUI Hello World compiled on GitHub macOS. Unsigned IPA for personal signing; installation on a physical iPhone has not yet been tested." \
+            --prerelease
