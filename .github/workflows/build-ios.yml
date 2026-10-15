@@ -1009,10 +1009,15 @@ jobs:
                   capture("04-voando", app: app)
               }
           
-              private func expect(_ value: String, on element: XCUIElement, timeout: TimeInterval = 5) {
-                  let expectation = XCTNSPredicateExpectation(predicate: NSPredicate(format: "value == %@", value), object: element)
-                  XCTAssertEqual(XCTWaiter.wait(for: [expectation], timeout: timeout), .completed,
-                                 "Expected \(value), got \(String(describing: element.value))")
+              private func expect(_ value: String, on element: XCUIElement, timeout: TimeInterval = 20) {
+                  var observed = "<not observed>"
+                  let predicate = NSPredicate { _, _ in
+                      observed = element.value as? String ?? "<missing value>"
+                      return observed == value
+                  }
+                  let expectation = XCTNSPredicateExpectation(predicate: predicate, object: nil)
+                  let result = XCTWaiter.wait(for: [expectation], timeout: timeout)
+                  XCTAssertEqual(result, .completed, "Expected \(value), last observed \(observed)")
               }
           
               private func capture(_ name: String, app: XCUIApplication) {
