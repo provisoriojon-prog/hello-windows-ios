@@ -48,8 +48,14 @@ jobs:
                   let low = floor + gap / 2 + 48 * scale
                   let high = ceiling - gap / 2 - 48 * scale
                   guard high >= low else { return (floor + ceiling) / 2 }
-                  let target = previous.map { $0 + (min(max(randomUnit, 0), 1) * 2 - 1) * 104 * scale }
-                      ?? (floor + ceiling) / 2
+                  let clampedRandom: Double = min(max(randomUnit, 0.0), 1.0)
+                  let delta: Double = (clampedRandom * 2.0 - 1.0) * 104.0 * scale
+                  let target: Double
+                  if let previousCenter = previous {
+                      target = previousCenter + delta
+                  } else {
+                      target = (floor + ceiling) / 2.0
+                  }
                   return min(max(target, low), high)
               }
           }
