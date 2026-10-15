@@ -1,4 +1,4 @@
-name: Build iOS IPA on macOS
+name: Build Voa iOS game on macOS
 on:
   workflow_dispatch:
   push:
@@ -14,64 +14,813 @@ jobs:
     steps:
       - name: Download source
         uses: actions/checkout@v6
-      - name: Create Hello World source
+      - name: Create native game and tests
         run: |
           mkdir -p HelloWindows
-          cat > HelloWindows/HelloWindowsApp.swift <<'HELLO_SOURCE'
+          cat > HelloWindows/HelloWindowsApp.swift <<'VOA_FILE_0'
+          import Foundation
+          
+          // Shared by the SpriteKit game and the deterministic command-line smoke tests.
+          enum FlightMath {
+              static func speed(score: Int) -> Double {
+                  172 + Double(min(max(score, 0), 18)) * 4
+              }
+          
+              static func gap(score: Int) -> Double {
+                  186 - Double(min(max(score, 0), 20)) * 1.3
+              }
+          
+              static func integrate(y: Double, velocity: Double, dt: Double, scale: Double) -> (y: Double, velocity: Double) {
+                  let gravity = 1_000 * scale
+                  return (y + velocity * dt - 0.5 * gravity * dt * dt, velocity - gravity * dt)
+              }
+          
+              static func circleHitsRect(x: Double, y: Double, radius: Double,
+                                         minX: Double, minY: Double, width: Double, height: Double) -> Bool {
+                  guard width > 0, height > 0 else { return false }
+                  let dx = x - min(max(x, minX), minX + width)
+                  let dy = y - min(max(y, minY), minY + height)
+                  return dx * dx + dy * dy <= radius * radius
+              }
+          
+              static func center(previous: Double?, randomUnit: Double, gap: Double,
+                                 floor: Double, ceiling: Double, scale: Double) -> Double {
+                  let low = floor + gap / 2 + 48 * scale
+                  let high = ceiling - gap / 2 - 48 * scale
+                  guard high >= low else { return (floor + ceiling) / 2 }
+                  let target = previous.map { $0 + (min(max(randomUnit, 0), 1) * 2 - 1) * 104 * scale }
+                      ?? (floor + ceiling) / 2
+                  return min(max(target, low), high)
+              }
+          }
+          
+          #if GAME_MATH_TESTS
+          @main
+          enum FlightMathSmokeTests {
+              static func main() {
+                  // The speed and opening stop changing, even after a very long run.
+                  precondition(FlightMath.speed(score: -1) == FlightMath.speed(score: 0))
+                  precondition(FlightMath.speed(score: 18) == FlightMath.speed(score: 100_000))
+                  precondition(FlightMath.gap(score: 20) == FlightMath.gap(score: 100_000))
+                  precondition(FlightMath.gap(score: 100_000) >= 160)
+          
+                  // Exact ballistic integration must not depend on rendering at 30 or 120 Hz.
+                  func flight(step: Double) -> (Double, Double) {
+                      var y = 300.0
+                      var velocity = 350.0
+                      for _ in 0..<Int((0.6 / step).rounded()) {
+                          let next = FlightMath.integrate(y: y, velocity: velocity, dt: step, scale: 1)
+                          y = next.y
+                          velocity = next.velocity
+                      }
+                      return (y, velocity)
+                  }
+                  let lowFPS = flight(step: 1 / 30)
+                  let highFPS = flight(step: 1 / 120)
+                  precondition(abs(lowFPS.0 - highFPS.0) < 0.000_001)
+                  precondition(abs(lowFPS.1 - highFPS.1) < 0.000_001)
+                  precondition(abs(lowFPS.0 - 330) < 0.000_001)
+          
+                  // Real circle/rectangle corners: a nearby corner is not automatically a hit.
+                  precondition(FlightMath.circleHitsRect(x: 5, y: 5, radius: 1, minX: 0, minY: 0, width: 10, height: 10))
+                  precondition(FlightMath.circleHitsRect(x: 12, y: 5, radius: 2, minX: 0, minY: 0, width: 10, height: 10))
+                  precondition(!FlightMath.circleHitsRect(x: 12, y: 12, radius: 2, minX: 0, minY: 0, width: 10, height: 10))
+                  precondition(!FlightMath.circleHitsRect(x: 0, y: 0, radius: 2, minX: 0, minY: 0, width: 0, height: 0))
+          
+                  // Thousands of deterministic extreme samples stay reachable and on screen.
+                  for scale in [0.8, 1.0, 1.6] {
+                      let floor = 86 * scale
+                      let ceiling = 740 * scale
+                      var previous: Double? = nil
+                      for score in 0..<2_000 {
+                          let gap = FlightMath.gap(score: score) * scale
+                          let random = Double((score * 73) % 101) / 100
+                          let next = FlightMath.center(previous: previous, randomUnit: random, gap: gap,
+                                                       floor: floor, ceiling: ceiling, scale: scale)
+                          precondition(next - gap / 2 >= floor + 48 * scale - 0.000_001)
+                          precondition(next + gap / 2 <= ceiling - 48 * scale + 0.000_001)
+                          if let previous = previous {
+                              precondition(abs(next - previous) <= 104 * scale + 0.000_001)
+                          }
+                          previous = next
+                      }
+                  }
+                  print("PASS: difficulty caps, frame-rate-independent flight, circle collisions, 6000 reachable openings")
+              }
+          }
+          #else
           import SwiftUI
+          import SpriteKit
+          import UIKit
           
           @main
           struct HelloWindowsApp: App {
               var body: some Scene {
-                  WindowGroup {
-                      ContentView()
+                  WindowGroup { ContentView() }
+              }
+          }
+          
+          enum FlightPhase: String {
+              case ready, playing, paused, gameOver
+          }
+          
+          final class FlightGame: ObservableObject {
+              @Published private(set) var phase: FlightPhase = .ready
+              @Published private(set) var score = 0
+              @Published private(set) var best: Int
+              let scene: FlightScene
+          
+              init() {
+                  best = UserDefaults.standard.integer(forKey: "voa.bestScore.v1")
+                  scene = FlightScene(size: CGSize(width: 390, height: 844))
+                  scene.scaleMode = .resizeFill
+                  scene.owner = self
+              }
+          
+              func tap() {
+                  switch phase {
+                  case .ready: start()
+                  case .playing: scene.flap()
+                  case .paused, .gameOver: break
                   }
+              }
+          
+              func start() {
+                  score = 0
+                  phase = .playing
+                  scene.begin()
+                  scene.flap()
+              }
+          
+              func pause() {
+                  guard phase == .playing else { return }
+                  phase = .paused
+                  scene.resetClock()
+              }
+          
+              func resume() {
+                  guard phase == .paused else { return }
+                  scene.resetClock()
+                  phase = .playing
+              }
+          
+              func scored() {
+                  guard phase == .playing else { return }
+                  score += 1
+                  if score > best {
+                      best = score
+                      UserDefaults.standard.set(best, forKey: "voa.bestScore.v1")
+                  }
+                  UISelectionFeedbackGenerator().selectionChanged()
+              }
+          
+              func crashed() {
+                  guard phase == .playing else { return }
+                  phase = .gameOver
+                  UINotificationFeedbackGenerator().notificationOccurred(.warning)
               }
           }
           
           struct ContentView: View {
-              @State private var taps = 0
+              @StateObject private var game = FlightGame()
+              @Environment(\.scenePhase) private var appPhase
+              private let ink = Color(red: 0.10, green: 0.27, blue: 0.31)
           
               var body: some View {
                   ZStack {
-                      LinearGradient(colors: [.indigo, .blue, .cyan],
-                                     startPoint: .topLeading, endPoint: .bottomTrailing)
+                      SpriteView(scene: game.scene, preferredFramesPerSecond: 60)
                           .ignoresSafeArea()
-                      VStack(spacing: 24) {
-                          Image(systemName: "hand.wave.fill")
-                              .font(.system(size: 76))
-                              .foregroundStyle(.yellow)
-                          Text("Olá, mundo!")
-                              .font(.system(size: 38, weight: .bold))
-                          Text("Criado no Windows.\nCompilado no macOS do GitHub.")
-                              .font(.title3)
-                              .multilineTextAlignment(.center)
-                          Button {
-                              taps += 1
-                          } label: {
-                              Text(taps == 0 ? "Toque para testar" : "Toques: \(taps)")
-                                  .font(.headline)
-                                  .padding(.horizontal, 28)
-                                  .padding(.vertical, 16)
-                                  .background(.white, in: Capsule())
-                                  .foregroundStyle(.indigo)
+                          .allowsHitTesting(false)
+          
+                      Color.clear
+                          .contentShape(Rectangle())
+                          .ignoresSafeArea()
+                          .onTapGesture { game.tap() }
+                          .accessibilityElement()
+                          .accessibilityLabel("Bater asas")
+                          .accessibilityAddTraits(.isButton)
+                          .accessibilityIdentifier("flap-game")
+                          .accessibilityHidden(game.phase != .playing)
+          
+                      VStack {
+                          header
+                          Spacer()
+                          if game.phase == .playing {
+                              Text("TOQUE PARA BATER ASAS")
+                                  .font(.system(size: 10, weight: .heavy, design: .rounded))
+                                  .tracking(2)
+                                  .foregroundStyle(ink.opacity(0.45))
+                                  .padding(.bottom, 78)
+                                  .allowsHitTesting(false)
                           }
-                          Text("Hello Windows • iOS nativo")
-                              .font(.footnote)
-                              .opacity(0.8)
                       }
+                      .padding(.horizontal, 22)
+                      .padding(.top, 12)
+          
+                      if game.phase == .ready { readyScreen }
+                      if game.phase == .paused { pauseScreen }
+                      if game.phase == .gameOver { gameOverScreen }
+                  }
+                  .foregroundStyle(ink)
+                  .onChange(of: appPhase) { phase in
+                      if phase != .active { game.pause() }
+                  }
+                  .preferredColorScheme(.light)
+                  .statusBarHidden(false)
+              }
+          
+              private var header: some View {
+                  HStack(alignment: .top) {
+                      Text("VOA!")
+                          .font(.system(size: 19, weight: .black, design: .rounded))
+                          .tracking(1)
+                          .padding(.horizontal, 15)
+                          .padding(.vertical, 11)
+                          .background(.white.opacity(0.82), in: Capsule())
+                          .accessibilityLabel("Estado do jogo")
+                          .accessibilityValue(game.phase.rawValue)
+                          .accessibilityIdentifier("flight-state")
+                          .allowsHitTesting(false)
+                      Spacer()
+                      VStack(spacing: 0) {
+                          Text("\(game.score)")
+                              .font(.system(size: 42, weight: .black, design: .rounded))
+                              .monospacedDigit()
+                          Text("PONTOS")
+                              .font(.system(size: 9, weight: .heavy, design: .rounded))
+                              .tracking(2)
+                      }
+                      .accessibilityElement(children: .ignore)
+                      .accessibilityLabel("Pontuação")
+                      .accessibilityValue("\(game.score)")
+                      .accessibilityIdentifier("flight-score")
+                      .allowsHitTesting(false)
+                      Spacer()
+                      if game.phase == .playing {
+                          Button { game.pause() } label: {
+                              Image(systemName: "pause.fill")
+                                  .font(.system(size: 17, weight: .black))
+                                  .frame(width: 48, height: 45)
+                                  .background(.white.opacity(0.82), in: Capsule())
+                          }
+                          .accessibilityLabel("Pausar")
+                          .accessibilityIdentifier("pause-game")
+                      } else {
+                          Color.clear.frame(width: 48, height: 45).allowsHitTesting(false)
+                      }
+                  }
+                  .buttonStyle(.plain)
+              }
+          
+              private var readyScreen: some View {
+                  VStack(spacing: 0) {
+                      Spacer().frame(height: 106)
+                      VStack(spacing: 10) {
+                          Text("Um pequeno voo.\nUm grande desafio.")
+                              .font(.system(size: 34, weight: .black, design: .rounded))
+                              .multilineTextAlignment(.center)
+                              .minimumScaleFactor(0.7)
+                          Text("Passe entre os canos e vá mais longe.")
+                              .font(.system(size: 14, weight: .medium, design: .rounded))
+                              .foregroundStyle(ink.opacity(0.65))
+                      }
+                      .allowsHitTesting(false)
+                      Spacer()
+                      VStack(spacing: 15) {
+                          Label("Recorde: \(game.best)", systemImage: "trophy.fill")
+                              .font(.system(size: 14, weight: .bold, design: .rounded))
+                              .foregroundStyle(ink.opacity(0.75))
+                              .allowsHitTesting(false)
+                          actionButton("Vamos voar", symbol: "arrow.up", identifier: "start-game") { game.start() }
+                          Text("Toque na tela para bater as asas")
+                              .font(.system(size: 12, weight: .medium, design: .rounded))
+                              .foregroundStyle(ink.opacity(0.65))
+                              .allowsHitTesting(false)
+                      }
+                      .padding(.bottom, 92)
+                  }
+                  .padding(.horizontal, 28)
+              }
+          
+              private var pauseScreen: some View {
+                  modal {
+                      Image(systemName: "pause.circle.fill")
+                          .font(.system(size: 42, weight: .bold))
+                          .foregroundStyle(Color(red: 0.13, green: 0.59, blue: 0.54))
+                      Text("Uma pausa no voo")
+                          .font(.system(size: 26, weight: .black, design: .rounded))
+                      Text("Respire. Seu passarinho espera aqui.")
+                          .font(.system(size: 14, weight: .medium, design: .rounded))
+                          .foregroundStyle(ink.opacity(0.65))
+                          .multilineTextAlignment(.center)
+                      actionButton("Continuar", symbol: "play.fill", identifier: "resume-game") { game.resume() }
+                      Button("Começar de novo") { game.start() }
+                          .font(.system(size: 14, weight: .bold, design: .rounded))
+                          .accessibilityIdentifier("restart-game")
+                          .padding(.top, 4)
+                  }
+              }
+          
+              private var gameOverScreen: some View {
+                  modal {
+                      Text(game.score > 0 && game.score == game.best ? "QUE VOO BONITO!" : "SÓ MAIS UMA?")
+                          .font(.system(size: 10, weight: .black, design: .rounded))
+                          .tracking(2.5)
+                          .foregroundStyle(Color(red: 0.13, green: 0.59, blue: 0.54))
+                      Text("Fim de voo")
+                          .font(.system(size: 34, weight: .black, design: .rounded))
+                      HStack(spacing: 36) {
+                          resultColumn("PONTOS", value: game.score)
+                          Rectangle().fill(ink.opacity(0.12)).frame(width: 1, height: 48)
+                          resultColumn("RECORDE", value: game.best)
+                      }
+                      .padding(.vertical, 8)
+                      actionButton("Voar de novo", symbol: "arrow.clockwise", identifier: "restart-game") { game.start() }
+                      Text("Cada toque dá um novo impulso.")
+                          .font(.system(size: 12, weight: .medium, design: .rounded))
+                          .foregroundStyle(ink.opacity(0.6))
+                  }
+              }
+          
+              private func resultColumn(_ title: String, value: Int) -> some View {
+                  VStack(spacing: 5) {
+                      Text("\(value)")
+                          .font(.system(size: 36, weight: .black, design: .rounded))
+                          .monospacedDigit()
+                      Text(title)
+                          .font(.system(size: 9, weight: .heavy, design: .rounded))
+                          .tracking(1.5)
+                  }
+                  .accessibilityElement(children: .combine)
+              }
+          
+              private func actionButton(_ title: String, symbol: String, identifier: String,
+                                        action: @escaping () -> Void) -> some View {
+                  Button(action: action) {
+                      HStack(spacing: 12) {
+                          Text(title)
+                          Image(systemName: symbol)
+                      }
+                      .font(.system(size: 17, weight: .heavy, design: .rounded))
                       .foregroundStyle(.white)
-                      .padding(24)
+                      .frame(maxWidth: .infinity)
+                      .padding(.vertical, 19)
+                      .background(Color(red: 0.10, green: 0.44, blue: 0.42), in: RoundedRectangle(cornerRadius: 23))
+                      .overlay(RoundedRectangle(cornerRadius: 23).stroke(.white.opacity(0.24), lineWidth: 1))
+                      .shadow(color: ink.opacity(0.17), radius: 0, x: 0, y: 5)
+                  }
+                  .buttonStyle(.plain)
+                  .accessibilityIdentifier(identifier)
+                  .frame(maxWidth: 310)
+              }
+          
+              private func modal<Content: View>(@ViewBuilder content: () -> Content) -> some View {
+                  ZStack {
+                      Color(red: 0.05, green: 0.22, blue: 0.25).opacity(0.28)
+                          .ignoresSafeArea()
+                          .contentShape(Rectangle())
+                      VStack(spacing: 18, content: content)
+                          .padding(28)
+                          .frame(maxWidth: 350)
+                          .background(Color(red: 1, green: 0.99, blue: 0.93), in: RoundedRectangle(cornerRadius: 32))
+                          .overlay(RoundedRectangle(cornerRadius: 32).stroke(.white.opacity(0.9), lineWidth: 2))
+                          .shadow(color: ink.opacity(0.16), radius: 28, x: 0, y: 16)
+                          .padding(24)
                   }
               }
           }
-          HELLO_SOURCE
-          cat > project.yml <<'HELLO_SOURCE'
+          
+          private final class PipePair {
+              let node = SKNode()
+              var x: CGFloat
+              var center: CGFloat
+              var gap: CGFloat
+              var scored = false
+          
+              init(x: CGFloat, center: CGFloat, gap: CGFloat) {
+                  self.x = x
+                  self.center = center
+                  self.gap = gap
+              }
+          }
+          
+          final class FlightScene: SKScene {
+              weak var owner: FlightGame?
+              private let backdrop = SKNode()
+              private let obstacles = SKNode()
+              private let ground = SKNode()
+              private let bird = SKNode()
+              private let wing = SKNode()
+              private var pipes: [PipePair] = []
+              private var clouds: [(node: SKNode, speed: CGFloat)] = []
+              private var groundMarks: [SKShapeNode] = []
+              private var configured = false
+              private var lastTime: TimeInterval?
+              private var idleTime: TimeInterval = 0
+              private var travel: CGFloat = 0
+              private var spawnTravel: CGFloat = 0
+              private var lastCenter: CGFloat?
+              private var birdY: CGFloat = 0
+              private var velocity: CGFloat = 0
+              private let gameplayTimeScale: Double = {
+                  #if DEBUG
+                  // UI automation needs time to query controls; release physics is untouched.
+                  return ProcessInfo.processInfo.arguments.contains("--ui-smoke-test") ? 0.1 : 1
+                  #else
+                  return 1
+                  #endif
+              }()
+          
+              private var unit: CGFloat { max(0.6, min(size.width / 390, size.height / 760)) }
+              private var groundHeight: CGFloat { 86 * unit }
+              private var ceiling: CGFloat { size.height - 105 * unit }
+              private var birdX: CGFloat { min(size.width * 0.29, 190 * unit) }
+              private var radius: CGFloat { 13 * unit }
+              private var pipeWidth: CGFloat { 66 * unit }
+              private var capWidth: CGFloat { 78 * unit }
+          
+              override func didMove(to view: SKView) {
+                  if !configured {
+                      configured = true
+                      addChild(backdrop)
+                      addChild(obstacles)
+                      addChild(ground)
+                      addChild(bird)
+                      backdrop.zPosition = -10
+                      obstacles.zPosition = 0
+                      ground.zPosition = 5
+                      bird.zPosition = 10
+                      rebuildWorld()
+                      setBirdToStart()
+                  }
+                  view.isMultipleTouchEnabled = false
+                  resetClock()
+              }
+          
+              override func didChangeSize(_ oldSize: CGSize) {
+                  guard configured, oldSize.width > 0, oldSize.height > 0 else { return }
+                  let ratioX = size.width / oldSize.width
+                  let ratioY = size.height / oldSize.height
+                  owner?.pause()
+                  birdY *= ratioY
+                  for pipe in pipes {
+                      pipe.x *= ratioX
+                      pipe.center *= ratioY
+                      pipe.gap *= ratioY
+                  }
+                  if let lastCenter = lastCenter { self.lastCenter = lastCenter * ratioY }
+                  rebuildWorld()
+                  for pipe in pipes { drawPipe(pipe) }
+                  bird.position = CGPoint(x: birdX, y: birdY)
+                  if owner?.phase == .ready { setBirdToStart() }
+                  resetClock()
+              }
+          
+              func resetClock() { lastTime = nil }
+          
+              func begin() {
+                  pipes.forEach { $0.node.removeFromParent() }
+                  pipes.removeAll()
+                  obstacles.removeAllActions()
+                  travel = 0
+                  spawnTravel = 0
+                  lastCenter = nil
+                  bird.removeAllActions()
+                  wing.removeAllActions()
+                  setBirdToStart()
+                  addPipe()
+                  resetClock()
+              }
+          
+              func flap() {
+                  velocity = 350 * unit
+                  wing.removeAllActions()
+                  wing.run(.sequence([
+                      .rotate(toAngle: -0.65, duration: 0.07, shortestUnitArc: true),
+                      .rotate(toAngle: 0.15, duration: 0.17, shortestUnitArc: true)
+                  ]))
+                  UIImpactFeedbackGenerator(style: .soft).impactOccurred(intensity: 0.45)
+              }
+          
+              override func update(_ currentTime: TimeInterval) {
+                  guard configured else { return }
+                  guard let previous = lastTime else {
+                      lastTime = currentTime
+                      return
+                  }
+                  lastTime = currentTime
+                  let elapsed = min(max(currentTime - previous, 0), 0.05)
+                  guard elapsed > 0 else { return }
+          
+                  if owner?.phase == .ready {
+                      idleTime += elapsed
+                      bird.position.y = birdY + CGFloat(sin(idleTime * 2.5)) * 7 * unit
+                      bird.zRotation = CGFloat(sin(idleTime * 2)) * 0.045
+                      wing.zRotation = CGFloat(sin(idleTime * 5)) * 0.17
+                      animateLandscape(dt: elapsed, speed: 26 * unit)
+                      return
+                  }
+                  guard owner?.phase == .playing else { return }
+          
+                  // Small physics steps avoid tunnelling and discard large app-resume deltas.
+                  let gameplayElapsed = elapsed * gameplayTimeScale
+                  let steps = max(1, Int(ceil(gameplayElapsed / (1.0 / 120))))
+                  let dt = gameplayElapsed / Double(steps)
+                  for _ in 0..<steps {
+                      guard owner?.phase == .playing else { break }
+                      advance(dt: dt)
+                  }
+              }
+          
+              private func advance(dt: Double) {
+                  let currentScore = owner?.score ?? 0
+                  let distance = CGFloat(FlightMath.speed(score: currentScore)) * unit * CGFloat(dt)
+                  let next = FlightMath.integrate(y: Double(birdY), velocity: Double(velocity), dt: dt, scale: Double(unit))
+                  birdY = CGFloat(next.y)
+                  velocity = CGFloat(next.velocity)
+                  if birdY > size.height - 24 * unit {
+                      birdY = size.height - 24 * unit
+                      velocity = min(velocity, 0)
+                  }
+                  bird.position = CGPoint(x: birdX, y: birdY)
+                  let targetRotation = min(0.45, max(-1.12, velocity / (650 * unit)))
+                  bird.zRotation += (targetRotation - bird.zRotation) * min(1, CGFloat(dt) * 11)
+          
+                  spawnTravel += distance
+                  if spawnTravel >= 238 * unit {
+                      spawnTravel -= 238 * unit
+                      addPipe()
+                  }
+                  for pipe in pipes {
+                      pipe.x -= distance
+                      pipe.node.position.x = pipe.x
+                  }
+          
+                  if birdY - radius <= groundHeight {
+                      birdY = groundHeight + radius
+                      bird.position.y = birdY
+                      crash()
+                      return
+                  }
+                  for pipe in pipes {
+                      if collides(with: pipe) {
+                          crash()
+                          return
+                      }
+                      if !pipe.scored, pipe.x + capWidth / 2 < birdX - radius {
+                          pipe.scored = true
+                          owner?.scored()
+                          bird.run(.sequence([.scale(to: 1.08, duration: 0.07), .scale(to: 1, duration: 0.12)]), withKey: "score-pop")
+                      }
+                  }
+                  pipes.removeAll { pipe in
+                      if pipe.x + capWidth / 2 < -10 * unit {
+                          pipe.node.removeFromParent()
+                          return true
+                      }
+                      return false
+                  }
+                  animateLandscape(dt: dt, speed: distance / CGFloat(dt))
+              }
+          
+              private func setBirdToStart() {
+                  birdY = groundHeight + (ceiling - groundHeight) * 0.52
+                  velocity = 0
+                  bird.position = CGPoint(x: birdX, y: birdY)
+                  bird.zRotation = 0
+                  bird.setScale(1)
+                  bird.alpha = 1
+              }
+          
+              private func addPipe() {
+                  let gap = CGFloat(FlightMath.gap(score: owner?.score ?? 0)) * unit
+                  let center = CGFloat(FlightMath.center(previous: lastCenter.map(Double.init), randomUnit: Double.random(in: 0...1),
+                                                        gap: Double(gap), floor: Double(groundHeight),
+                                                        ceiling: Double(ceiling), scale: Double(unit)))
+                  lastCenter = center
+                  let pipe = PipePair(x: size.width + capWidth, center: center, gap: gap)
+                  pipes.append(pipe)
+                  obstacles.addChild(pipe.node)
+                  drawPipe(pipe)
+              }
+          
+              private func drawPipe(_ pipe: PipePair) {
+                  pipe.node.removeAllChildren()
+                  pipe.node.position = CGPoint(x: pipe.x, y: 0)
+                  let lowerTop = pipe.center - pipe.gap / 2
+                  let upperBottom = pipe.center + pipe.gap / 2
+                  let green = UIColor(red: 0.19, green: 0.67, blue: 0.56, alpha: 1)
+                  let edge = UIColor(red: 0.10, green: 0.43, blue: 0.39, alpha: 1)
+                  for rect in [CGRect(x: -pipeWidth / 2, y: groundHeight - 3, width: pipeWidth, height: max(1, lowerTop - groundHeight + 3)),
+                               CGRect(x: -pipeWidth / 2, y: upperBottom, width: pipeWidth, height: max(1, size.height - upperBottom + 5))] {
+                      let body = SKShapeNode(rect: rect, cornerRadius: 6 * unit)
+                      body.fillColor = green
+                      body.strokeColor = edge
+                      body.lineWidth = 2.5 * unit
+                      pipe.node.addChild(body)
+                      let shine = SKShapeNode(rect: CGRect(x: rect.minX + 7 * unit, y: rect.minY + 2 * unit,
+                                                          width: 8 * unit, height: max(1, rect.height - 4 * unit)), cornerRadius: 3 * unit)
+                      shine.fillColor = UIColor.white.withAlphaComponent(0.16)
+                      shine.strokeColor = .clear
+                      pipe.node.addChild(shine)
+                  }
+                  for y in [lowerTop - 22 * unit, upperBottom] {
+                      let cap = SKShapeNode(rect: CGRect(x: -capWidth / 2, y: y, width: capWidth, height: 22 * unit), cornerRadius: 6 * unit)
+                      cap.fillColor = UIColor(red: 0.26, green: 0.74, blue: 0.62, alpha: 1)
+                      cap.strokeColor = edge
+                      cap.lineWidth = 2.5 * unit
+                      pipe.node.addChild(cap)
+                      let highlight = SKShapeNode(rect: CGRect(x: -capWidth / 2 + 7 * unit, y: y + 14 * unit, width: capWidth - 14 * unit, height: 3 * unit), cornerRadius: 1.5 * unit)
+                      highlight.fillColor = .white.withAlphaComponent(0.3)
+                      highlight.strokeColor = .clear
+                      pipe.node.addChild(highlight)
+                  }
+              }
+          
+              private func collides(with pipe: PipePair) -> Bool {
+                  guard abs(pipe.x - birdX) < capWidth / 2 + radius else { return false }
+                  let lowerTop = pipe.center - pipe.gap / 2
+                  let upperBottom = pipe.center + pipe.gap / 2
+                  let rects = [
+                      CGRect(x: pipe.x - pipeWidth / 2, y: groundHeight, width: pipeWidth, height: max(0, lowerTop - groundHeight)),
+                      CGRect(x: pipe.x - capWidth / 2, y: lowerTop - 22 * unit, width: capWidth, height: 22 * unit),
+                      CGRect(x: pipe.x - pipeWidth / 2, y: upperBottom, width: pipeWidth, height: max(0, size.height - upperBottom)),
+                      CGRect(x: pipe.x - capWidth / 2, y: upperBottom, width: capWidth, height: 22 * unit)
+                  ]
+                  return rects.contains { rect in
+                      FlightMath.circleHitsRect(x: Double(birdX), y: Double(birdY), radius: Double(radius),
+                                                minX: Double(rect.minX), minY: Double(rect.minY),
+                                                width: Double(rect.width), height: Double(rect.height))
+                  }
+              }
+          
+              private func crash() {
+                  owner?.crashed()
+                  bird.removeAction(forKey: "score-pop")
+                  bird.setScale(1)
+                  bird.run(.sequence([
+                      .rotate(byAngle: -0.15, duration: 0.05),
+                      .rotate(byAngle: 0.23, duration: 0.07),
+                      .rotate(byAngle: -0.08, duration: 0.06)
+                  ]))
+              }
+          
+              private func rebuildWorld() {
+                  backdrop.removeAllChildren()
+                  ground.removeAllChildren()
+                  bird.removeAllChildren()
+                  wing.removeAllChildren()
+                  clouds.removeAll()
+                  groundMarks.removeAll()
+          
+                  let renderer = UIGraphicsImageRenderer(size: CGSize(width: 4, height: 256))
+                  let sky = renderer.image { context in
+                      let colors = [UIColor(red: 0.67, green: 0.88, blue: 0.94, alpha: 1).cgColor,
+                                    UIColor(red: 0.93, green: 0.97, blue: 0.88, alpha: 1).cgColor] as CFArray
+                      if let gradient = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(), colors: colors, locations: [0, 1]) {
+                          context.cgContext.drawLinearGradient(gradient, start: .zero, end: CGPoint(x: 0, y: 256), options: [])
+                      }
+                  }
+                  let skyNode = SKSpriteNode(texture: SKTexture(image: sky))
+                  skyNode.size = size
+                  skyNode.position = CGPoint(x: size.width / 2, y: size.height / 2)
+                  backdrop.addChild(skyNode)
+          
+                  let sun = ellipse(width: 105 * unit, height: 105 * unit, color: UIColor(red: 1, green: 0.96, blue: 0.73, alpha: 0.65))
+                  sun.position = CGPoint(x: size.width * 0.79, y: size.height * 0.77)
+                  backdrop.addChild(sun)
+                  for index in 0..<6 {
+                      let cloud = SKNode()
+                      let s = (index % 2 == 0 ? 1.0 : 0.72) * unit
+                      for (x, y, width, height) in [(-25.0, 0.0, 49.0, 25.0), (0.0, 10.0, 58.0, 40.0), (29.0, 0.0, 51.0, 27.0)] {
+                          let puff = ellipse(width: width * s, height: height * s, color: .white.withAlphaComponent(0.62))
+                          puff.position = CGPoint(x: x * s, y: y * s)
+                          cloud.addChild(puff)
+                      }
+                      cloud.position = CGPoint(x: CGFloat(index) * (size.width + 100 * unit) / 5 - 50 * unit,
+                                               y: size.height * (index % 2 == 0 ? 0.75 : 0.88))
+                      backdrop.addChild(cloud)
+                      clouds.append((cloud, CGFloat(4 + index % 3) * unit))
+                  }
+                  for index in 0..<7 {
+                      let width = (210 + CGFloat(index % 3) * 35) * unit
+                      let hill = ellipse(width: width, height: (115 + CGFloat(index % 2) * 35) * unit,
+                                         color: UIColor(red: 0.61 + CGFloat(index % 2) * 0.05, green: 0.83, blue: 0.71, alpha: 0.62))
+                      hill.position = CGPoint(x: CGFloat(index) * size.width / 5 - 60 * unit, y: groundHeight - 10 * unit)
+                      backdrop.addChild(hill)
+                  }
+                  let soil = SKShapeNode(rect: CGRect(x: 0, y: 0, width: size.width, height: groundHeight))
+                  soil.fillColor = UIColor(red: 0.92, green: 0.80, blue: 0.59, alpha: 1)
+                  soil.strokeColor = .clear
+                  ground.addChild(soil)
+                  let grass = SKShapeNode(rect: CGRect(x: 0, y: groundHeight - 13 * unit, width: size.width, height: 13 * unit))
+                  grass.fillColor = UIColor(red: 0.46, green: 0.70, blue: 0.49, alpha: 1)
+                  grass.strokeColor = .clear
+                  ground.addChild(grass)
+                  let lip = SKShapeNode(rect: CGRect(x: 0, y: groundHeight - 2 * unit, width: size.width, height: 3 * unit))
+                  lip.fillColor = UIColor(red: 0.70, green: 0.85, blue: 0.56, alpha: 1)
+                  lip.strokeColor = .clear
+                  ground.addChild(lip)
+                  for _ in 0..<Int(size.width / (34 * unit)) + 3 {
+                      let mark = SKShapeNode(rect: CGRect(x: 0, y: groundHeight - 23 * unit, width: 16 * unit, height: 4 * unit), cornerRadius: 2 * unit)
+                      mark.fillColor = UIColor(red: 0.76, green: 0.62, blue: 0.42, alpha: 0.45)
+                      mark.strokeColor = .clear
+                      ground.addChild(mark)
+                      groundMarks.append(mark)
+                  }
+                  buildBird()
+                  animateLandscape(dt: 0, speed: 0)
+              }
+          
+              private func buildBird() {
+                  let outline = UIColor(red: 0.61, green: 0.36, blue: 0.11, alpha: 1)
+                  let tail = SKShapeNode(path: polygon([CGPoint(x: -18, y: -2), CGPoint(x: -33, y: 8), CGPoint(x: -29, y: -8)]))
+                  tail.fillColor = UIColor(red: 0.96, green: 0.60, blue: 0.26, alpha: 1)
+                  tail.strokeColor = outline
+                  tail.lineWidth = 1.7
+                  bird.addChild(tail)
+                  let body = ellipse(width: 46, height: 37, color: UIColor(red: 1, green: 0.78, blue: 0.25, alpha: 1))
+                  body.strokeColor = outline
+                  body.lineWidth = 1.7
+                  bird.addChild(body)
+                  let belly = ellipse(width: 24, height: 20, color: UIColor(red: 1, green: 0.91, blue: 0.55, alpha: 1))
+                  belly.position = CGPoint(x: 3, y: -6)
+                  bird.addChild(belly)
+                  let tuft = SKShapeNode(path: polygon([CGPoint(x: -5, y: 17), CGPoint(x: -10, y: 26), CGPoint(x: 0, y: 21), CGPoint(x: 6, y: 25), CGPoint(x: 7, y: 17)]))
+                  tuft.fillColor = UIColor(red: 1, green: 0.78, blue: 0.25, alpha: 1)
+                  tuft.strokeColor = outline
+                  tuft.lineWidth = 1.5
+                  bird.addChild(tuft)
+                  let eye = ellipse(width: 15, height: 18, color: .white)
+                  eye.position = CGPoint(x: 11, y: 6)
+                  bird.addChild(eye)
+                  let pupil = ellipse(width: 6, height: 9, color: UIColor(red: 0.14, green: 0.23, blue: 0.24, alpha: 1))
+                  pupil.position = CGPoint(x: 14, y: 6)
+                  bird.addChild(pupil)
+                  let sparkle = ellipse(width: 2.5, height: 3.5, color: .white)
+                  sparkle.position = CGPoint(x: 15, y: 8)
+                  bird.addChild(sparkle)
+                  let beak = SKShapeNode(path: polygon([CGPoint(x: 21, y: 0), CGPoint(x: 34, y: -2), CGPoint(x: 22, y: -8)]))
+                  beak.fillColor = UIColor(red: 1, green: 0.48, blue: 0.23, alpha: 1)
+                  beak.strokeColor = outline
+                  beak.lineWidth = 1.5
+                  bird.addChild(beak)
+                  let cheek = ellipse(width: 9, height: 5, color: UIColor(red: 1, green: 0.49, blue: 0.31, alpha: 0.6))
+                  cheek.position = CGPoint(x: 12, y: -6)
+                  bird.addChild(cheek)
+                  let feather = ellipse(width: 23, height: 14, color: UIColor(red: 0.96, green: 0.62, blue: 0.18, alpha: 1))
+                  feather.position = CGPoint(x: -8, y: -4)
+                  feather.strokeColor = outline.withAlphaComponent(0.65)
+                  feather.lineWidth = 1.3
+                  wing.addChild(feather)
+                  bird.addChild(wing)
+                  // The parent scale is reserved for score feedback, so scale the drawing once.
+                  for child in bird.children { child.setScale(unit) }
+              }
+          
+              private func animateLandscape(dt: TimeInterval, speed: CGFloat) {
+                  for cloud in clouds {
+                      cloud.node.position.x -= (cloud.speed + speed * 0.035) * CGFloat(dt)
+                      if cloud.node.position.x < -90 * unit { cloud.node.position.x = size.width + 90 * unit }
+                  }
+                  travel += speed * CGFloat(dt)
+                  let offset = travel.truncatingRemainder(dividingBy: 34 * unit)
+                  for (index, mark) in groundMarks.enumerated() {
+                      mark.position.x = CGFloat(index - 1) * 34 * unit - offset
+                  }
+              }
+          
+              private func ellipse(width: CGFloat, height: CGFloat, color: UIColor) -> SKShapeNode {
+                  let shape = SKShapeNode(ellipseOf: CGSize(width: width, height: height))
+                  shape.fillColor = color
+                  shape.strokeColor = .clear
+                  return shape
+              }
+          
+              private func polygon(_ points: [CGPoint]) -> CGPath {
+                  let path = CGMutablePath()
+                  if let first = points.first {
+                      path.move(to: first)
+                      for point in points.dropFirst() { path.addLine(to: point) }
+                      path.closeSubpath()
+                  }
+                  return path
+              }
+          }
+          #endif
+          VOA_FILE_0
+          mkdir -p .
+          cat > project.yml <<'VOA_FILE_1'
           name: HelloWindows
           options:
             bundleIdPrefix: com.demo
             deploymentTarget:
               iOS: "16.0"
+          settings:
+            base:
+              SWIFT_VERSION: "5.0"
+              CODE_SIGNING_ALLOWED: NO
+              CODE_SIGNING_REQUIRED: NO
           targets:
             HelloWindows:
               type: application
@@ -82,34 +831,46 @@ jobs:
                 base:
                   PRODUCT_BUNDLE_IDENTIFIER: com.demo.hellowindows
                   PRODUCT_NAME: HelloWindows
-                  SWIFT_VERSION: "5.0"
                   TARGETED_DEVICE_FAMILY: "1,2"
-                  CODE_SIGNING_ALLOWED: NO
-                  CODE_SIGNING_REQUIRED: NO
-                  MARKETING_VERSION: "1.0"
-                  CURRENT_PROJECT_VERSION: "1"
+                  MARKETING_VERSION: "2.0"
+                  CURRENT_PROJECT_VERSION: "2"
+                  ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
               info:
                 path: HelloWindows/Info.plist
                 properties:
-                  CFBundleDisplayName: Hello Windows
+                  CFBundleDisplayName: Voa!
                   LSRequiresIPhoneOS: true
                   UILaunchScreen: {}
+                  UIRequiresFullScreen: true
                   UIApplicationSceneManifest:
                     UIApplicationSupportsMultipleScenes: false
                   UISupportedInterfaceOrientations:
                     - UIInterfaceOrientationPortrait
-                    - UIInterfaceOrientationLandscapeLeft
-                    - UIInterfaceOrientationLandscapeRight
+            FlightUITests:
+              type: bundle.ui-testing
+              platform: iOS
+              sources:
+                - UITests
+              dependencies:
+                - target: HelloWindows
+              settings:
+                base:
+                  GENERATE_INFOPLIST_FILE: YES
           schemes:
             HelloWindows:
               build:
                 targets:
                   HelloWindows: all
+                  FlightUITests: [test]
+              test:
+                config: Debug
+                targets:
+                  - FlightUITests
               archive:
                 config: Release
-          HELLO_SOURCE
+          VOA_FILE_1
           mkdir -p scripts
-          cat > scripts/verify_ipa.py <<'HELLO_SOURCE'
+          cat > scripts/verify_ipa.py <<'VOA_FILE_2'
           """Inspect the actual IPA produced by Xcode, fail if it is not an iPhone binary."""
           import hashlib
           import json
@@ -149,15 +910,143 @@ jobs:
                   "note": "Real compiled device binary; signing and physical installation still required.",
               }
           print(json.dumps(result, indent=2))
-          HELLO_SOURCE
+          VOA_FILE_2
+          mkdir -p scripts
+          cat > scripts/make_icon.swift <<'VOA_FILE_3'
+          import AppKit
+          
+          let side = 1024
+          let bitmap = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: side, pixelsHigh: side,
+              bitsPerSample: 8, samplesPerPixel: 3, hasAlpha: false, isPlanar: false,
+              colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
+          NSGraphicsContext.saveGraphicsState()
+          NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: bitmap)
+          let bounds = NSRect(x: 0, y: 0, width: CGFloat(side), height: CGFloat(side))
+          NSGradient(starting: NSColor(calibratedRed: 0.10, green: 0.65, blue: 0.74, alpha: 1),
+                     ending: NSColor(calibratedRed: 0.55, green: 0.88, blue: 0.86, alpha: 1))!.draw(in: bounds, angle: 90)
+          func ellipse(_ r: NSRect, _ color: NSColor) {
+              color.setFill()
+              NSBezierPath(ovalIn: r).fill()
+          }
+          let white = NSColor.white
+          ellipse(NSRect(x: -90, y: 185, width: 390, height: 110), white.withAlphaComponent(0.18))
+          ellipse(NSRect(x: 780, y: 735, width: 340, height: 100), white.withAlphaComponent(0.22))
+          let shadow = NSShadow()
+          shadow.shadowColor = NSColor(calibratedRed: 0.09, green: 0.35, blue: 0.36, alpha: 0.22)
+          shadow.shadowBlurRadius = 24
+          shadow.shadowOffset = NSSize(width: 0, height: -20)
+          NSGraphicsContext.saveGraphicsState()
+          shadow.set()
+          ellipse(NSRect(x: 225, y: 255, width: 570, height: 505), NSColor(calibratedRed: 1, green: 0.75, blue: 0.24, alpha: 1))
+          NSGraphicsContext.restoreGraphicsState()
+          ellipse(NSRect(x: 248, y: 300, width: 280, height: 260), NSColor(calibratedRed: 1, green: 0.91, blue: 0.56, alpha: 1))
+          ellipse(NSRect(x: 235, y: 410, width: 230, height: 185), NSColor(calibratedRed: 0.99, green: 0.58, blue: 0.16, alpha: 1))
+          ellipse(NSRect(x: 565, y: 505, width: 155, height: 175), white)
+          ellipse(NSRect(x: 633, y: 540, width: 60, height: 85), NSColor(calibratedRed: 0.12, green: 0.25, blue: 0.27, alpha: 1))
+          ellipse(NSRect(x: 650, y: 590, width: 16, height: 20), white)
+          let beak = NSBezierPath()
+          beak.move(to: NSPoint(x: 730, y: 520))
+          beak.line(to: NSPoint(x: 865, y: 475))
+          beak.line(to: NSPoint(x: 730, y: 430))
+          beak.close()
+          NSColor(calibratedRed: 0.99, green: 0.36, blue: 0.20, alpha: 1).setFill()
+          beak.fill()
+          ellipse(NSRect(x: 555, y: 410, width: 75, height: 35), NSColor(calibratedRed: 1, green: 0.48, blue: 0.30, alpha: 0.8))
+          NSGraphicsContext.restoreGraphicsState()
+          let destination = "HelloWindows/Assets.xcassets/AppIcon.appiconset"
+          try FileManager.default.createDirectory(atPath: destination, withIntermediateDirectories: true)
+          try bitmap.representation(using: .png, properties: [:])!.write(to: URL(fileURLWithPath: destination + "/icon.png"))
+          let contents = #"{"images":[{"filename":"icon.png","idiom":"universal","platform":"ios","size":"1024x1024"}],"info":{"author":"xcode","version":1}}"#
+          try contents.write(toFile: destination + "/Contents.json", atomically: true, encoding: .utf8)
+          try #"{"info":{"author":"xcode","version":1}}"#.write(toFile: "HelloWindows/Assets.xcassets/Contents.json", atomically: true, encoding: .utf8)
+          print("Generated original Voa! icon")
+          VOA_FILE_3
+          mkdir -p UITests
+          cat > UITests/FlightUITests.swift <<'VOA_FILE_4'
+          import XCTest
+          
+          final class FlightUITests: XCTestCase {
+              override func setUpWithError() throws {
+                  continueAfterFailure = false
+              }
+          
+              func testStartPauseBackgroundCollisionAndRestart() {
+                  let app = XCUIApplication()
+                  // Slow the Debug physics clock so XCTest's UI synchronization can't outrun a round.
+                  // The Release IPA keeps the normal real-time clock.
+                  app.launchArguments = ["--ui-smoke-test"]
+                  app.launch()
+                  let state = app.descendants(matching: .any).matching(identifier: "flight-state").firstMatch
+                  XCTAssertTrue(state.waitForExistence(timeout: 10))
+                  expect("ready", on: state)
+                  capture("01-inicio", app: app)
+          
+                  app.buttons["start-game"].tap()
+                  expect("playing", on: state)
+                  app.buttons["pause-game"].tap()
+                  expect("paused", on: state)
+                  capture("02-pausa", app: app)
+                  app.buttons["resume-game"].tap()
+                  expect("playing", on: state)
+          
+                  XCUIDevice.shared.press(.home)
+                  app.activate()
+                  expect("paused", on: state)
+                  app.buttons["resume-game"].tap()
+                  expect("playing", on: state)
+                  // With no further flaps, gravity must end the round, not leave it hanging.
+                  expect("gameOver", on: state, timeout: 25)
+                  capture("03-fim", app: app)
+                  XCTAssertTrue(app.buttons["restart-game"].exists)
+                  app.buttons["restart-game"].tap()
+                  expect("playing", on: state)
+                  capture("04-voando", app: app)
+              }
+          
+              private func expect(_ value: String, on element: XCUIElement, timeout: TimeInterval = 5) {
+                  let expectation = XCTNSPredicateExpectation(predicate: NSPredicate(format: "value == %@", value), object: element)
+                  XCTAssertEqual(XCTWaiter.wait(for: [expectation], timeout: timeout), .completed,
+                                 "Expected \(value), got \(String(describing: element.value))")
+              }
+          
+              private func capture(_ name: String, app: XCUIApplication) {
+                  let attachment = XCTAttachment(screenshot: app.screenshot())
+                  attachment.name = name
+                  attachment.lifetime = .keepAlways
+                  add(attachment)
+              }
+          }
+          VOA_FILE_4
+          mkdir -p .
+          cat > README.md <<'VOA_FILE_5'
+          # Voa!
+          
+          Jogo iOS nativo inspirado na mecânica de tocar para voar, feito em SwiftUI e SpriteKit. Arte vetorial original, sem downloads, anúncios ou conta dentro do jogo.
+          
+          Toque para voar, atravesse as aberturas, marque pontos e tente superar seu recorde. O jogo pausa quando você sai do aplicativo.
+          
+          ## Instalação
+          
+          Importe `Voa-unsigned.ipa` no AltStore Classic, usando o mesmo procedimento do Hello World. O identificador continua `com.demo.hellowindows`, e o nome na tela inicial passa a ser **Voa!**.
+          
+          ## Compilação
+          
+          O workflow usa macOS e Xcode no GitHub Actions. O código-fonte está incluído no próprio workflow, permitindo editar e recompilar pelo navegador do Windows. Este pacote também contém os arquivos separados para edição.
+          
+          O IPA é compilado para um iPhone real ARM64 e precisa ser assinado pelo AltStore antes da instalação. Os testes de interface são executados no simulador; o teste físico do jogo será feito no iPhone do usuário.
+          VOA_FILE_5
       - name: Record macOS and Xcode
         run: |
           mkdir -p dist
           sw_vers | tee dist/build-environment.txt
           xcodebuild -version | tee -a dist/build-environment.txt
           xcrun --sdk iphoneos --show-sdk-version | tee -a dist/build-environment.txt
-      - name: Generate Xcode project
+      - name: Verify game rules and generate project
         run: |
+          set -o pipefail
+          swiftc -D GAME_MATH_TESTS -parse-as-library HelloWindows/HelloWindowsApp.swift -o /tmp/voa-math
+          /tmp/voa-math | tee dist/game-rules-tests.txt
+          swift scripts/make_icon.swift
           brew install xcodegen
           xcodegen generate
       - name: Compile real iPhone application
@@ -169,38 +1058,61 @@ jobs:
             -archivePath build/HelloWindows.xcarchive \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" archive 2>&1 | tee dist/xcodebuild.log
+      - name: Play smoke test on iPhone simulator
+        run: |
+          set -o pipefail
+          xcrun simctl list devices available -j > build/simulators.json
+          DEVICE_ID=$(python3 -c 'import json; d=json.load(open("build/simulators.json")); print(next(v["udid"] for k,vs in sorted(d["devices"].items(),reverse=True) if "iOS" in k for v in vs if "iPhone" in v["name"] and v.get("isAvailable",False)))')
+          xcodebuild -project HelloWindows.xcodeproj -scheme HelloWindows \
+            -configuration Debug -destination "platform=iOS Simulator,id=$DEVICE_ID" \
+            -parallel-testing-enabled NO -maximum-concurrent-test-simulator-destinations 1 \
+            -resultBundlePath build/FlightUI.xcresult \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            test 2>&1 | tee dist/simulator-tests.log
+          xcrun xcresulttool export attachments --path build/FlightUI.xcresult --output-path build/screenshots
+          python3 - <<'PY'
+          from pathlib import Path
+          import shutil
+          shots = sorted(Path('build/screenshots').rglob('*.png'))
+          assert shots, 'No simulator screenshots exported'
+          for i, shot in enumerate(shots[:8], 1):
+              shutil.copy2(shot, f'dist/Voa-simulator-{i}.png')
+          print(f'Exported {len(shots)} real simulator screenshots')
+          PY
       - name: Package and inspect unsigned IPA
         run: |
           mkdir -p build/package/Payload
           cp -R build/HelloWindows.xcarchive/Products/Applications/HelloWindows.app build/package/Payload/
           cd build/package
-          zip -r -q ../../dist/HelloWindows-unsigned.ipa Payload
+          zip -r -q ../../dist/Voa-unsigned.ipa Payload
           cd ../..
           file build/package/Payload/HelloWindows.app/HelloWindows | tee dist/binary-inspection.txt
           xcrun lipo -archs build/package/Payload/HelloWindows.app/HelloWindows | tee -a dist/binary-inspection.txt
-          python3 scripts/verify_ipa.py dist/HelloWindows-unsigned.ipa > dist/verification.json
-          shasum -a 256 dist/HelloWindows-unsigned.ipa | tee dist/SHA256.txt
+          python3 scripts/verify_ipa.py dist/Voa-unsigned.ipa > dist/verification.json
+          shasum -a 256 dist/Voa-unsigned.ipa | tee dist/SHA256.txt
+          zip -r -q dist/Voa-source.zip HelloWindows project.yml scripts UITests README.md .github/workflows/build-ios.yml
           {
-            echo '### iPhone IPA compiled successfully on macOS'
-            echo 'Unsigned application: Apple signing is still required to install on an iPhone.'
+            echo '### Voa! native game compiled and simulator tests passed'
+            echo 'Import Voa-unsigned.ipa into AltStore Classic for personal signing.'
             echo "Commit: $GITHUB_SHA"
             echo '```'
-            cat dist/build-environment.txt dist/binary-inspection.txt dist/SHA256.txt
+            cat dist/build-environment.txt dist/binary-inspection.txt dist/game-rules-tests.txt dist/SHA256.txt
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-      - name: Save IPA and build evidence
+      - name: Save build evidence
+        if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: HelloWindows-IPA-and-proof
+          name: Voa-IPA-and-proof
           path: dist/
           if-no-files-found: error
           retention-days: 30
-      - name: Publish direct IPA download
+      - name: Publish direct game download
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "hello-${GITHUB_RUN_NUMBER}" dist/* \
+          gh release create "voa-${GITHUB_RUN_NUMBER}" dist/* \
             --target "$GITHUB_SHA" \
-            --title "Hello Windows - iOS build ${GITHUB_RUN_NUMBER}" \
-            --notes "Native SwiftUI Hello World compiled on GitHub macOS. Unsigned IPA for personal signing; installation on a physical iPhone has not yet been tested." \
+            --title "Voa! - jogo iOS ${GITHUB_RUN_NUMBER}" \
+            --notes "Jogo nativo original em SwiftUI e SpriteKit. Toque para voar, atravesse obstaculos e supere seu recorde. Compilado para iPhone ARM64; regras e interface verificadas no simulador. Importe Voa-unsigned.ipa no AltStore Classic para assinar, como no Hello World. Mesmo identificador do app anterior. Teste fisico do jogo ainda a realizar." \
             --prerelease
